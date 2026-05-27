@@ -99,8 +99,9 @@ fn write_temp_script(name: &str, content: &str) -> anyhow::Result<PathBuf> {
     #[cfg(windows)]
     let suffix = ".cmd";
 
+    let prefix = format!("openab-hook-{name}-");
     let mut builder = tempfile::Builder::new();
-    builder.prefix(&format!("openab-hook-{name}-")).suffix(suffix);
+    builder.prefix(prefix.as_str()).suffix(suffix);
 
     #[cfg(unix)]
     {
@@ -183,7 +184,7 @@ async fn execute(path: &PathBuf, timeout_secs: u64) -> anyhow::Result<()> {
 
     // Pass through cloud credential env vars for IAM-based auth (IRSA, Workload Identity, ECS task role)
     for (key, val) in std::env::vars() {
-        let dominated = key.starts_with("AWS_")
+        let pass = key.starts_with("AWS_")
             || key.starts_with("AMAZON_")
             || key.starts_with("ECS_CONTAINER_METADATA_URI")
             || key.starts_with("GOOGLE_")
@@ -195,7 +196,7 @@ async fn execute(path: &PathBuf, timeout_secs: u64) -> anyhow::Result<()> {
             || key == "BOOTSTRAP_PERSONAL_URI"
             || key == "STATE_BUCKET"
             || key == "TASK_FAMILY";
-        if dominated {
+        if pass {
             cmd.env(&key, &val);
         }
     }
