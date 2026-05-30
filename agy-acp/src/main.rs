@@ -80,6 +80,7 @@ impl Adapter {
         let lock_file = fs::OpenOptions::new()
             .create(true)
             .write(true)
+            .truncate(false)
             .open(&lock_path)
             .ok()?;
         lock_file.lock_exclusive().ok()?;
@@ -177,6 +178,32 @@ impl Adapter {
         full_text.to_string()
     }
 
+    fn evict_if_needed(&mut self) {
+        const MAX_SESSIONS: usize = 64;
+        while self.sessions.len() >= MAX_SESSIONS {
+            if let Some(key) = self.sessions.keys().next().cloned() {
+                self.sessions.remove(&key);
+            }
+        }
+    }
+
+    fn restore_session_state(&mut self, session_id: &str) -> bool {
+        let Some(conversation_id) = self.restore_session(session_id) else {
+            return false;
+        };
+        if !self.sessions.contains_key(session_id) {
+            self.evict_if_needed();
+        }
+        self.sessions.insert(
+            session_id.to_string(),
+            Session {
+                conversation_id: Some(conversation_id),
+                prev_output: String::new(),
+            },
+        );
+        true
+    }
+
     fn handle_initialize(&self, id: u64) -> JsonRpcResponse {
         JsonRpcResponse {
             jsonrpc: "2.0",
@@ -184,7 +211,7 @@ impl Adapter {
             result: Some(json!({
                 "protocolVersion": 1,
                 "agentInfo": { "name": "agy", "version": env!("CARGO_PKG_VERSION") },
-                "agentCapabilities": { "streaming": true, "loadSession": false },
+                "agentCapabilities": { "streaming": true, "loadSession": true },
             })),
             error: None,
         }
@@ -192,14 +219,7 @@ impl Adapter {
 
     fn handle_session_new(&mut self, id: u64) -> JsonRpcResponse {
         let session_id = Uuid::new_v4().to_string();
-        // Evict an arbitrary session if at capacity (prevent unbounded growth)
-        const MAX_SESSIONS: usize = 64;
-        while self.sessions.len() >= MAX_SESSIONS {
-            if let Some(key) = self.sessions.keys().next().cloned() {
-                self.sessions.remove(&key);
-            }
-        }
-        // Try to restore from persisted state (relevant if client reuses session IDs)
+        self.evict_if_needed();
         let conversation_id = None;
         self.sessions.insert(
             session_id.clone(),
@@ -216,6 +236,41 @@ impl Adapter {
         }
     }
 
+    fn handle_session_load(&mut self, id: u64, params: &Value) -> JsonRpcResponse {
+        let session_id = params
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if session_id.is_empty() {
+            return JsonRpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: None,
+                error: Some(json!({"code":-32602,"message":"missing sessionId"})),
+            };
+        }
+
+        if self.restore_session_state(session_id) {
+            return JsonRpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: Some(json!({})),
+                error: None,
+            };
+        }
+
+        JsonRpcResponse {
+            jsonrpc: "2.0",
+            id,
+            result: None,
+            error: Some(json!({
+                "code": -32000,
+                "message": format!("unknown sessionId: {session_id}"),
+            })),
+        }
+    }
+
     async fn handle_session_prompt(&mut self, id: u64, params: &Value) -> Vec<String> {
         let session_id = params
             .get("sessionId")
@@ -224,15 +279,7 @@ impl Adapter {
 
         // Restore evicted session from state file if needed
         if !session_id.is_empty() && !self.sessions.contains_key(session_id) {
-            if let Some(conv_id) = self.restore_session(session_id) {
-                self.sessions.insert(
-                    session_id.to_string(),
-                    Session {
-                        conversation_id: Some(conv_id),
-                        prev_output: String::new(),
-                    },
-                );
-            }
+            let _ = self.restore_session_state(session_id);
         }
 
         let prompt_text = params
@@ -429,6 +476,10 @@ async fn main() {
             Some("session/new") => {
                 vec![serde_json::to_string(&adapter.handle_session_new(id)).unwrap()]
             }
+            Some("session/load") => {
+                let params = req.params.unwrap_or(json!({}));
+                vec![serde_json::to_string(&adapter.handle_session_load(id, &params)).unwrap()]
+            }
             Some("session/prompt") => {
                 let params = req.params.unwrap_or(json!({}));
                 adapter.handle_session_prompt(id, &params).await
@@ -490,6 +541,80 @@ mod tests {
     fn test_extract_delta_preserves_leading_spaces() {
         let result = Adapter::extract_delta("hello\n", "hello\n  indented code", true);
         assert_eq!(result, "  indented code");
+    }
+
+    #[test]
+    fn test_initialize_advertises_load_session_support() {
+        let adapter = Adapter::new();
+        let response = adapter.handle_initialize(1);
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|r| r.get("agentCapabilities"))
+                .and_then(|c| c.get("loadSession"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_session_load_restores_persisted_session() {
+        let root = std::env::temp_dir().join(format!("agy-acp-load-{}", Uuid::new_v4()));
+        let _ = fs::create_dir_all(&root);
+
+        let mut adapter = Adapter {
+            sessions: HashMap::new(),
+            working_dir: root.to_string_lossy().to_string(),
+            conversations_dir: root.join("conversations"),
+            state_file: root.join("sessions.json"),
+        };
+        adapter.persist_session("sess-1", Some("conv-abc"));
+
+        let response = adapter.handle_session_load(7, &json!({"sessionId": "sess-1"}));
+        assert!(response.error.is_none());
+        assert_eq!(
+            adapter
+                .sessions
+                .get("sess-1")
+                .and_then(|s| s.conversation_id.as_deref()),
+            Some("conv-abc")
+        );
+        assert_eq!(
+            adapter
+                .sessions
+                .get("sess-1")
+                .map(|s| s.prev_output.as_str()),
+            Some("")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_session_load_rejects_unknown_session() {
+        let root = std::env::temp_dir().join(format!("agy-acp-missing-{}", Uuid::new_v4()));
+        let _ = fs::create_dir_all(&root);
+
+        let mut adapter = Adapter {
+            sessions: HashMap::new(),
+            working_dir: root.to_string_lossy().to_string(),
+            conversations_dir: root.join("conversations"),
+            state_file: root.join("sessions.json"),
+        };
+
+        let response = adapter.handle_session_load(9, &json!({"sessionId": "missing"}));
+        assert!(response.result.is_none());
+        assert_eq!(
+            response
+                .error
+                .as_ref()
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str()),
+            Some("unknown sessionId: missing")
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
