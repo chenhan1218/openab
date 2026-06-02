@@ -141,30 +141,55 @@ impl AcpServer {
             .clone()
             .or_else(|| std::env::var("OPENAB_AGENT_PROVIDER").ok())
             .unwrap_or_default();
+        let model_override = self.active_model.as_deref();
         let (provider, active_provider): (Box<dyn crate::llm::LlmProvider>, &str) =
             match provider_choice.as_str() {
-                "anthropic" => match AnthropicProvider::from_env() {
-                    Ok(p) => (Box::new(p), "anthropic"),
-                    Err(e) => return self.error_response(id, -32000, &e),
-                },
-                "openai" | "codex" => match crate::llm::OpenAiProvider::from_auth_store() {
-                    Ok(p) => (Box::new(p), "openai"),
-                    Err(e) => return self.error_response(id, -32000, &e),
-                },
+                "anthropic" => {
+                    let res = match model_override {
+                        Some(m) => AnthropicProvider::from_env_with_model(m),
+                        None => AnthropicProvider::from_env(),
+                    };
+                    match res {
+                        Ok(p) => (Box::new(p), "anthropic"),
+                        Err(e) => return self.error_response(id, -32000, &e),
+                    }
+                }
+                "openai" | "codex" => {
+                    let res = match model_override {
+                        Some(m) => crate::llm::OpenAiProvider::from_auth_store_with_model(m),
+                        None => crate::llm::OpenAiProvider::from_auth_store(),
+                    };
+                    match res {
+                        Ok(p) => (Box::new(p), "openai"),
+                        Err(e) => return self.error_response(id, -32000, &e),
+                    }
+                }
                 _ => {
                     // Auto-detect: try API key first, then OAuth token
-                    match AnthropicProvider::from_env() {
+                    let anthropic_res = match model_override {
+                        Some(m) => AnthropicProvider::from_env_with_model(m),
+                        None => AnthropicProvider::from_env(),
+                    };
+                    match anthropic_res {
                         Ok(p) => (Box::new(p), "anthropic"),
-                        Err(_) => match crate::llm::OpenAiProvider::from_auth_store() {
-                            Ok(p) => (Box::new(p), "openai"),
-                            Err(e) => {
-                                return self.error_response(
-                                    id,
-                                    -32000,
-                                    &format!("No credentials: set ANTHROPIC_API_KEY or run `openab-agent auth codex-oauth`. {e}"),
-                                )
+                        Err(_) => {
+                            let openai_res = match model_override {
+                                Some(m) => {
+                                    crate::llm::OpenAiProvider::from_auth_store_with_model(m)
+                                }
+                                None => crate::llm::OpenAiProvider::from_auth_store(),
+                            };
+                            match openai_res {
+                                Ok(p) => (Box::new(p), "openai"),
+                                Err(e) => {
+                                    return self.error_response(
+                                        id,
+                                        -32000,
+                                        &format!("No credentials: set ANTHROPIC_API_KEY or run `openab-agent auth codex-oauth`. {e}"),
+                                    )
+                                }
                             }
-                        },
+                        }
                     }
                 }
             };
@@ -317,18 +342,28 @@ impl AcpServer {
         self.active_provider = Some(provider_name.to_string());
 
         // Rebuild the current session's provider so the switch takes effect immediately
-        if !session_id.is_empty() {
-            if let Some(_agent) = self.sessions.remove(session_id) {
-                let new_provider: Result<Box<dyn crate::llm::LlmProvider>, String> =
-                    match provider_name {
-                        "anthropic" => AnthropicProvider::from_env().map(|p| Box::new(p) as _),
-                        _ => {
-                            crate::llm::OpenAiProvider::from_auth_store().map(|p| Box::new(p) as _)
-                        }
-                    };
-                if let Ok(p) = new_provider {
+        if !session_id.is_empty() && self.sessions.contains_key(session_id) {
+            let new_provider: Result<Box<dyn crate::llm::LlmProvider>, String> = match provider_name
+            {
+                "anthropic" => {
+                    AnthropicProvider::from_env_with_model(value).map(|p| Box::new(p) as _)
+                }
+                _ => crate::llm::OpenAiProvider::from_auth_store_with_model(value)
+                    .map(|p| Box::new(p) as _),
+            };
+            match new_provider {
+                Ok(p) => {
+                    // Atomic: only remove old session after new provider succeeds
+                    self.sessions.remove(session_id);
                     let agent = Agent::new_boxed(p, self.working_dir.clone());
                     self.sessions.insert(session_id.to_string(), agent);
+                }
+                Err(e) => {
+                    return self.error_response(
+                        id,
+                        -32000,
+                        &format!("failed to switch provider: {e}"),
+                    );
                 }
             }
         }
