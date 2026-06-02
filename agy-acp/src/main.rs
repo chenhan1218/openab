@@ -150,7 +150,7 @@ impl Adapter {
             .filter_map(|e| e.ok())
             .filter_map(|e| {
                 let path = e.path();
-                if path.extension().map(|x| x == "pb").unwrap_or(false) {
+                if path.extension().map(|x| x == "pb" || x == "db").unwrap_or(false) {
                     path.file_stem().map(|s| s.to_string_lossy().to_string())
                 } else {
                     None
@@ -748,6 +748,36 @@ mod tests {
 
         let before = adapter.conversation_snapshot();
         fs::write(conv_dir.join("new-conv.pb"), b"new").unwrap();
+
+        assert_eq!(
+            adapter.new_conversation_id(&before),
+            Some("new-conv".to_string())
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[ignore] // filesystem I/O — run with CHI_INTEG=1
+    fn test_snapshot_detects_db_format_conversations() {
+        let root = std::env::temp_dir().join(format!("agy-acp-db-{}", Uuid::new_v4()));
+        let conv_dir = root.join("conversations");
+        fs::create_dir_all(&conv_dir).unwrap();
+        fs::write(conv_dir.join("existing.db"), b"old").unwrap();
+
+        let adapter = Adapter {
+            sessions: HashMap::new(),
+            working_dir: root.to_string_lossy().to_string(),
+            conversations_dir: conv_dir.clone(),
+            state_file: root.join("sessions.json"),
+        };
+
+        let before = adapter.conversation_snapshot();
+        assert!(before.contains("existing"));
+
+        fs::write(conv_dir.join("new-conv.db"), b"new").unwrap();
+        // WAL sidecar files should not be picked up
+        fs::write(conv_dir.join("new-conv.db-wal"), b"wal").unwrap();
+        fs::write(conv_dir.join("new-conv.db-shm"), b"shm").unwrap();
 
         assert_eq!(
             adapter.new_conversation_id(&before),
