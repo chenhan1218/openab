@@ -532,44 +532,48 @@ mod tests {
         assert!(used, "should report Reply API was used");
     }
 
-    /// Unsupported LINE commands should be ignored and must not consume the cached reply token.
+    /// All unsupported LINE commands should be ignored without consuming the cached reply token.
     #[tokio::test]
-    async fn line_ignores_reaction_commands_without_touching_cache() {
-        let server = MockServer::start().await;
-        let _reply = Mock::given(method("POST"))
-            .and(path("/v2/bot/message/reply"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
-            .mount_as_scoped(&server)
+    async fn line_ignores_unsupported_commands_without_touching_cache() {
+        let unsupported = &["add_reaction", "remove_reaction", "create_topic"];
+
+        for cmd in unsupported {
+            let server = MockServer::start().await;
+            let _reply = Mock::given(method("POST"))
+                .and(path("/v2/bot/message/reply"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount_as_scoped(&server)
+                .await;
+            let _push = Mock::given(method("POST"))
+                .and(path("/v2/bot/message/push"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount_as_scoped(&server)
+                .await;
+
+            let cache = make_cache();
+            cache
+                .lock()
+                .unwrap()
+                .insert("evt_unsup".into(), ("tok_unsup".into(), Instant::now()));
+
+            let client = reqwest::Client::new();
+            let used = adapters::line::dispatch_line_reply(
+                &client,
+                "test_access_token",
+                &cache,
+                &make_reply_with_command("evt_unsup", cmd, "payload"),
+                &server.uri(),
+            )
             .await;
-        let _push = Mock::given(method("POST"))
-            .and(path("/v2/bot/message/push"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
-            .mount_as_scoped(&server)
-            .await;
 
-        let cache = make_cache();
-        cache
-            .lock()
-            .unwrap()
-            .insert("evt_reaction".into(), ("tok_reaction".into(), Instant::now()));
-
-        let client = reqwest::Client::new();
-        let used = adapters::line::dispatch_line_reply(
-            &client,
-            "test_access_token",
-            &cache,
-            &make_reply_with_command("evt_reaction", "add_reaction", "👀"),
-            &server.uri(),
-        )
-        .await;
-
-        assert!(!used, "ignored LINE commands should not report reply usage");
-        assert!(
-            cache.lock().unwrap().contains_key("evt_reaction"),
-            "ignored LINE commands should not consume the cached reply token"
-        );
+            assert!(!used, "{cmd}: should not report reply usage");
+            assert!(
+                cache.lock().unwrap().contains_key("evt_unsup"),
+                "{cmd}: should not consume the cached reply token"
+            );
+        }
     }
 
     /// Cache miss: falls back to Push API with correct "to", bearer token, and message body.
