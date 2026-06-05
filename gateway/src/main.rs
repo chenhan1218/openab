@@ -15,7 +15,7 @@ use schema::GatewayReply;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Semaphore};
 use tracing::{info, warn};
 
 // --- Reply token cache for LINE hybrid Reply/Push dispatch ---
@@ -32,6 +32,11 @@ pub const REPLY_TOKEN_TTL_SECS: u64 = 50;
 /// Maximum number of cached reply tokens. Prevents unbounded memory growth
 /// if webhooks arrive faster than OAB can reply (e.g. OAB offline, spam burst).
 pub const REPLY_TOKEN_CACHE_MAX: usize = 10_000;
+
+/// Maximum number of post-ack LINE webhook payloads processed concurrently.
+/// Keeps image download/decode work bounded during bursts without giving up the
+/// fast 200 OK response path.
+pub const LINE_WEBHOOK_CONCURRENCY_MAX: usize = 8;
 
 // --- App state (shared across all adapters) ---
 
@@ -62,6 +67,9 @@ pub struct AppState {
     /// the first client to `remove()` a token wins the free Reply API call;
     /// other clients for the same event naturally fall back to Push API.
     pub reply_token_cache: ReplyTokenCache,
+    /// Limits concurrent post-ack LINE webhook processing so image bursts do not
+    /// turn into unbounded download/decode work.
+    pub line_webhook_semaphore: Arc<Semaphore>,
     /// Shared HTTP client for media downloads and API calls
     pub client: reqwest::Client,
 }
@@ -380,6 +388,7 @@ async fn main() -> Result<()> {
         ws_token,
         event_tx,
         reply_token_cache,
+        line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
         client,
     });
 

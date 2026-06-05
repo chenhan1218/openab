@@ -99,7 +99,20 @@ pub async fn webhook(
 
     let webhook_received_at = std::time::Instant::now();
     let background_state = state.clone();
+    let permit = match background_state
+        .line_webhook_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            warn!("LINE webhook worker semaphore closed unexpectedly");
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE;
+        }
+    };
     tokio::spawn(async move {
+        let _permit = permit;
         process_line_webhook_events(background_state, webhook_body, webhook_received_at).await;
     });
 
@@ -120,6 +133,11 @@ async fn process_line_webhook_events(
     // - Cons: once 200 OK is returned, a later crash/task failure will not be
     //   retried by LINE. This PR intentionally keeps scope small and does not add
     //   background-task durability or duplicate suppression on top of early-ack.
+    // - Cons: an earlier image event from one webhook payload can also be emitted
+    //   after a later text event from another payload if the image path is slower.
+    // - Guardrail: a shared semaphore bounds how many LINE payloads can enter the
+    //   post-ack path concurrently. When saturated, new webhooks wait for capacity
+    //   before spawning background work so bursts do not create unbounded backlog.
     for event in webhook_body.events {
         let Some(gateway_event) = build_gateway_event_from_line_event(
             &event,
@@ -292,7 +310,7 @@ pub async fn download_line_image(
     message_id: &str,
     api_base: &str,
 ) -> Option<Attachment> {
-    let resp = match client
+    let mut resp = match client
         .get(format!(
             "{}/v2/bot/message/{}/content",
             api_base, message_id
@@ -322,20 +340,25 @@ pub async fn download_line_image(
         }
     }
 
-    let bytes = match resp.bytes().await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            warn!(message_id, error = %e, "LINE image download failed while reading body");
+    let mut body = Vec::new();
+    loop {
+        let chunk = match resp.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(e) => {
+                warn!(message_id, error = %e, "LINE image download failed while reading body");
+                return None;
+            }
+        };
+        body.extend_from_slice(&chunk);
+        if body.len() as u64 > IMAGE_MAX_DOWNLOAD {
+            warn!(message_id, size = body.len(), "LINE image exceeds limit");
             return None;
         }
-    };
-    if bytes.len() as u64 > IMAGE_MAX_DOWNLOAD {
-        warn!(message_id, size = bytes.len(), "LINE image exceeds limit");
-        return None;
     }
 
     let (compressed, mime) =
-        match tokio::task::spawn_blocking(move || resize_and_compress(&bytes)).await {
+        match tokio::task::spawn_blocking(move || resize_and_compress(&body)).await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 warn!(message_id, error = %e, "LINE image resize/compress failed");
@@ -455,7 +478,7 @@ mod tests {
     use axum::extract::State;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::sync::{broadcast, Mutex};
+    use tokio::sync::{broadcast, Mutex, Semaphore};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -592,6 +615,7 @@ mod tests {
             ws_token: None,
             event_tx,
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            line_webhook_semaphore: Arc::new(Semaphore::new(crate::LINE_WEBHOOK_CONCURRENCY_MAX)),
             client: reqwest::Client::new(),
         });
 
