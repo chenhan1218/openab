@@ -92,3 +92,34 @@ tests:
       - matchRegex:
           path: data["config.toml"]
           pattern: '\[hooks\.pre_shutdown\]'
+
+  - it: rejects when no script source is set in preBoot
+    set:
+      agents.kiro.hooks.preBoot.timeoutSeconds: 60
+    asserts:
+      - failedTemplate:
+          errorPattern: "must set exactly one of: script, inline, url"
+
+  - it: rejects when multiple sources are set in preBoot
+    set:
+      agents.kiro.hooks.preBoot.script: "/boot.sh"
+      agents.kiro.hooks.preBoot.inline: "#!/bin/sh\necho hi"
+    asserts:
+      - failedTemplate:
+          errorPattern: "must set exactly one of: script, inline, url"
+
+  - it: rejects invalid onFailure value
+    set:
+      agents.kiro.hooks.preBoot.script: "/boot.sh"
+      agents.kiro.hooks.preBoot.onFailure: "ignore"
+    asserts:
+      - failedTemplate:
+          errorPattern: "onFailure must be one of: abort, warn"
+
+  - it: rejects non-positive timeoutSeconds
+    set:
+      agents.kiro.hooks.preBoot.script: "/boot.sh"
+      agents.kiro.hooks.preBoot.timeoutSeconds: 0
+    asserts:
+      - failedTemplate:
+          errorPattern: "timeoutSeconds must be a positive integer"
