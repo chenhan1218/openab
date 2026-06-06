@@ -40,9 +40,9 @@ COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/
 USER agent
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
-ENV OPENAB_AGENT_COMMAND=openab-agent
+ENV OPENAB_AGENT_COMMAND=kiro-cli
 ENV OPENAB_AGENT_WORKING_DIR=/home/agent
-ENV OPENAB_AGENT_AUTH_COMMAND="openab-agent auth codex-oauth"
+ENV OPENAB_AGENT_AUTH_COMMAND="kiro-cli login --use-device-flow"
 
 ENTRYPOINT ["tini", "--"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
