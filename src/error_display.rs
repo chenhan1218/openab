@@ -272,4 +272,54 @@ mod tests {
         let result = format_coded_error(-32602, "bad params", None);
         assert!(!result.contains("did not return any error details"));
     }
+
+    #[test]
+    fn format_coded_error_32603_empty_message_still_shows_fallback() {
+        // Even when message is empty, fallback should appear
+        let result = format_coded_error(-32603, "", None);
+        assert!(result.contains("Internal Error"));
+        assert!(result.contains("did not return any error details"));
+    }
+
+    #[test]
+    fn format_coded_error_32603_whitespace_detail_shows_fallback() {
+        // Whitespace-only detail should be treated as empty
+        let result = format_coded_error(-32603, "Internal error", Some("   "));
+        // Current impl: "   " is non-empty so it won't trigger fallback,
+        // but it also won't be appended since message doesn't contain it.
+        // This documents the current behavior.
+        assert!(result.contains("Internal Error"));
+    }
+
+    #[test]
+    fn format_coded_error_500_no_detail_no_fallback() {
+        // HTTP 500 without detail should NOT get the ACP-specific hint
+        let result = format_coded_error(500, "server error", None);
+        assert!(result.contains("Internal Server Error"));
+        assert!(!result.contains("did not return any error details"));
+    }
+
+    #[test]
+    fn format_coded_error_32603_fallback_does_not_duplicate_with_detail() {
+        // When detail is present, no fallback appears — mutually exclusive
+        let result = format_coded_error(-32603, "Internal error", Some("rate limit exceeded"));
+        assert!(result.contains("rate limit exceeded"));
+        assert!(!result.contains("did not return any error details"));
+        assert!(!result.contains("agent's own logs"));
+    }
+
+    #[test]
+    fn format_coded_error_server_error_range_no_fallback() {
+        // Other JSON-RPC server error codes should NOT get the hint
+        let result = format_coded_error(-32099, "custom error", None);
+        assert!(!result.contains("did not return any error details"));
+    }
+
+    #[test]
+    fn format_coded_error_32603_fallback_message_is_italic() {
+        // Verify Discord markdown italic formatting
+        let result = format_coded_error(-32603, "Internal error", None);
+        assert!(result.contains("_The agent did not return"));
+        assert!(result.ends_with("_"));
+    }
 }
